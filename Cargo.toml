@@ -1,0 +1,18 @@
+[package]
+name = "rasp_lora_client"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+oscore = {git = "https://github.com/DavidCarl/oscore"}
+rand = "*"
+x25519-dalek-ng = { version = "1.1.1", default-features = false, features = ["u32_backend"] }
+
+rppal = { version = "0.13.1", features = ["hal"] }
+sx127x_lora =  {git = "https://github.com/DavidCarl/sx127x_lora"}
+linux-embedded-hal = {version = "0.2.2"}
+
+serde_json = "1.0.79"
+serde = { version = "1.0", features = ["derive"] }
