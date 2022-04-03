@@ -212,8 +212,9 @@ fn edhoc_third_message(
     };
 
     // sending message 2
-    let mut payload3 = [2].to_vec();
-    payload3.extend(msg3_bytes);
+    // let mut payload3 = [2].to_vec();
+    // payload3.extend(msg3_bytes);
+    let mut payload3 = prepare_message(msg3_bytes, 2, false);
     Ok((payload3, msg4_receiver_verifier))
 }
 
