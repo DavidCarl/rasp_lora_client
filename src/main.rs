@@ -4,6 +4,8 @@ extern crate sx127x_lora;
 use std::fmt;
 use std::{error::Error as stdError, result::Result};
 
+use std::{thread, time};
+
 // RANDOM
 
 use rand::{rngs::StdRng, Rng, SeedableRng};
@@ -70,6 +72,7 @@ const R_STATIC_MATERIAL: [u8; 32] = [
 
 const DEVEUI: [u8; 8] = [0x1, 1, 2, 3, 2, 4, 5, 7];
 const APPEUI: [u8; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
+const DHR_CONST : u16 = 1;
 
 static mut FCNTUP: u16 = 0;
 static mut DEVADDR: [u8; 4] = [0, 0, 0, 0];
@@ -95,17 +98,77 @@ struct MessageStruct {
 fn main() {
     //println!("Hello, world!");
     let lora = setup_sx127x();
-    let (mut lora, ed_sck, ed_rck, ed_rk) = edhoc_handshake(lora).unwrap();
-    unsafe {
-        let mut i_ratchet = state::init_i(
-            ed_rk.try_into().unwrap(),
-            ed_rck.try_into().unwrap(),
-            ed_sck.try_into().unwrap(),
-            DEVADDR.to_vec(),
-        );
+    let (mut lora, ed_sck, ed_rck, ed_rk, devaddr) = edhoc_handshake(lora).unwrap();
+    println!("cleared EDHOC");
+    //let mut i_ratchet: Option<state> = Some(None);
+    let mut i_ratchet = state::init_i(
+        ed_rk.try_into().unwrap(),
+        ed_rck.try_into().unwrap(),
+        ed_sck.try_into().unwrap(),
+        devaddr.clone(),
+    );
+    for n in 1..18000 {
+        let uplink = i_ratchet.ratchet_encrypt_payload(&[1; 34], &devaddr);
+        let (msg_uplink, len_uplink) = lora_send(uplink);
+        println!("uplink");
+        let transmit = lora.transmit_payload_busy(msg_uplink, len_uplink);
+        match transmit {
+            Ok(packet_size) => {
+                println!("Sent packet with size: {:?}", packet_size)
+            }
+            Err(_) => println!("Error uplink"),
+        }
+
+        let ten_millis = time::Duration::from_millis(100);
+
+        thread::sleep(ten_millis);
+
+
+        if i_ratchet.fcnt_send >= DHR_CONST {
+            let dhr_req = i_ratchet.i_initiate_ratch();
+            let (msg_dhr_req, len_dhr_req) = lora_send(dhr_req);
+            println!("DHR_CONST");
+            let transmit = lora.transmit_payload_busy(msg_dhr_req, len_dhr_req);
+            match transmit {
+                Ok(packet_size) => {
+                    println!("DHR_CONST Sent packet with size: {:?}", packet_size)
+                }
+                Err(_) => println!("DHR_CONST Error {:?}", n),
+            }
+            let poll = lora.poll_irq(Some(5000), &mut Delay);
+            match poll {
+                Ok(size) => {
+                    println!("Recieved packet with size: {:?}", size);
+                    let buffer = lora.read_packet().unwrap();
+                    let dhr_ack = &buffer; // if this is not the dhrack, it will still be decrypted and handled
+                    match i_ratchet.i_receive(dhr_ack.to_vec()) {
+                        Some(x) => {
+                            println!("receiving message from server {:?}", x)
+                        }
+                        None => continue,
+                    };
+                }
+                _ => println!("Error happened at DHR_REQ")
+            }
+        } else {
+            let poll = lora.poll_irq(Some(5000), &mut Delay);
+            match poll {
+                Ok(size) => {
+                    println!("Recieved packet with size: {:?}", size);
+                    let buffer = lora.read_packet().unwrap();
+                    let downlink = &buffer; // if this is not the dhrack, it will still be decrypted and handled
+                    match i_ratchet.i_receive(downlink.to_vec()) {
+                        Some(x) => {
+                            println!("receiving message from server {:?}", x)
+                        }
+                        None => continue,
+                    };
+                }
+                _ => println!("Error happened at DHR_REQ")
+            }
+        }
     }
     //lora.poll_irq(Some(5000), &mut Delay);
-    println!("cleared EDHOC");
 }
 
 fn load_file(path: String) -> String {
@@ -116,7 +179,16 @@ fn load_file(path: String) -> String {
 
 fn edhoc_handshake(
     mut lora: LoRa<Spi, OutputPin, OutputPin>,
-) -> Result<(LoRa<Spi, OutputPin, OutputPin>, Vec<u8>, Vec<u8>, Vec<u8>), Box<dyn stdError>> {
+) -> Result<
+    (
+        LoRa<Spi, OutputPin, OutputPin>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+    ),
+    Box<dyn stdError>,
+> {
     // Sender besked til server - Send
     // Modtager besked fra server - Listen
     // Sender til server - Send
@@ -177,9 +249,9 @@ fn edhoc_handshake(
                                     match buffer[0] {
                                         3 => {
                                             //println!("Do something");
-                                            let (ed_sck, ed_rck, ed_rk) =
+                                            let (ed_sck, ed_rck, ed_rk, devaddr) =
                                                 handle_message_fourth(buffer, Msg4_Reciever);
-                                            Ok((lora, ed_sck, ed_rck, ed_rk))
+                                            Ok((lora, ed_sck, ed_rck, ed_rk, devaddr))
                                         }
                                         _ => {
                                             //println!("VAGT I GEVÆRET, NOGLE SNYDER");
@@ -292,7 +364,7 @@ fn edhoc_third_message(
 fn handle_message_fourth(
     msg: Vec<u8>,
     msg4_receiver_verifier: PartyI<Msg4ReceiveVerify>,
-) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
     //let msg = remove_devaddr(msg);
     let msgStruc = remove_message(msg);
     //println!("msg4 {:?}", msgStruc.msg);
@@ -308,7 +380,7 @@ fn handle_message_fourth(
     };
     let (ed_sck, ed_rck, ed_rk) = out;
 
-    (ed_sck, ed_rck, ed_rk)
+    (ed_sck, ed_rck, ed_rk, msgStruc.devaddr.to_vec())
 }
 
 fn remove_devaddr(msg: Vec<u8>) -> Vec<u8> {

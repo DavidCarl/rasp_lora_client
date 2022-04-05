@@ -423,7 +423,7 @@ checksum = "624a8340c38c1b80fd549087862da4ba43e08858af025b236e509b6649fc13d5"
 [[package]]
 name = "oscore"
 version = "0.1.0"
-source = "git+https://github.com/DavidCarl/oscore#a1a4606808966167773778429e76cfc43c325c5c"
+source = "git+https://github.com/DavidCarl/oscore#2e1967f1c1d87ceca94f9e2e0eebcffd5e13d41b"
 dependencies = [
  "aes",
  "ccm",
