@@ -7,6 +7,7 @@ edition = "2021"
 
 [dependencies]
 oscore = {git = "https://github.com/DavidCarl/oscore"}
+twoRatchet = {git = "https://github.com/S3j5b0/Double_ratchet"}
 rand = "*"
 x25519-dalek-ng = { version = "1.1.1", default-features = false, features = ["u32_backend"] }
 

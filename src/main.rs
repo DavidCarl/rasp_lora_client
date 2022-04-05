@@ -1,7 +1,8 @@
 extern crate linux_embedded_hal as hal;
 extern crate sx127x_lora;
 
-use std::result::Result;
+use std::fmt;
+use std::{error::Error as stdError, result::Result};
 
 // RANDOM
 
@@ -16,6 +17,10 @@ use oscore::edhoc::{
     util::build_error_message,
     PartyI,
 };
+
+// Ratchet
+
+use twoRatchet::ratchfuncs::state;
 
 // LORA MODULE
 
@@ -50,8 +55,8 @@ struct Device {
     key: Vec<u8>,
 }
 
-const SUITE_I: isize = 3;
-const METHOD_TYPE_I: isize = 0;
+const SUITE_I: u8 = 3;
+const METHOD_TYPE_I: u8 = 0;
 
 const I_STATIC_MATERIAL: [u8; 32] = [
     154, 31, 220, 202, 59, 128, 114, 237, 96, 201, 18, 178, 29, 143, 85, 133, 70, 32, 155, 41, 124,
@@ -67,12 +72,40 @@ const DEVEUI: [u8; 8] = [0x1, 1, 2, 3, 2, 4, 5, 7];
 const APPEUI: [u8; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
 
 static mut FCNTUP: u16 = 0;
-static mut DEVADDR: [u8; 4] = [0,0,0,0];
+static mut DEVADDR: [u8; 4] = [0, 0, 0, 0];
+
+#[derive(Debug)]
+struct MyError(String);
+
+impl fmt::Display for MyError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "There is an error: {}", self.0)
+    }
+}
+
+impl stdError for MyError {}
+
+struct MessageStruct {
+    m: u8,
+    fcntdown: [u8; 2],
+    devaddr: [u8; 4],
+    msg: Vec<u8>,
+}
 
 fn main() {
-    println!("Hello, world!");
+    //println!("Hello, world!");
     let lora = setup_sx127x();
-    edhoc_handshake(lora);
+    let (mut lora, ed_sck, ed_rck, ed_rk) = edhoc_handshake(lora).unwrap();
+    unsafe {
+        let mut i_ratchet = state::init_i(
+            ed_rk.try_into().unwrap(),
+            ed_rck.try_into().unwrap(),
+            ed_sck.try_into().unwrap(),
+            DEVADDR.to_vec(),
+        );
+    }
+    //lora.poll_irq(Some(5000), &mut Delay);
+    println!("cleared EDHOC");
 }
 
 fn load_file(path: String) -> String {
@@ -81,7 +114,9 @@ fn load_file(path: String) -> String {
     data
 }
 
-fn edhoc_handshake(mut lora: LoRa<Spi, OutputPin, OutputPin>) {
+fn edhoc_handshake(
+    mut lora: LoRa<Spi, OutputPin, OutputPin>,
+) -> Result<(LoRa<Spi, OutputPin, OutputPin>, Vec<u8>, Vec<u8>, Vec<u8>), Box<dyn stdError>> {
     // Sender besked til server - Send
     // Modtager besked fra server - Listen
     // Sender til server - Send
@@ -115,34 +150,70 @@ fn edhoc_handshake(mut lora: LoRa<Spi, OutputPin, OutputPin>) {
 
     let poll = lora.poll_irq(Some(5000), &mut Delay);
     match poll {
-        Ok(_size) => {
+        Ok(size) => {
+            println!("Recieved packet with size: {:?}", size);
             let buffer = lora.read_packet().unwrap(); // Received buffer. NOTE: 255 bytes are always returned
-            println! {"{:?}", buffer}
+                                                      //println! {"{:?}", buffer}
             match buffer[0] {
                 1 => {
-                    let msg = &buffer[1..];
-                    //let (msg3, Msg4_Reciever) = 
-                    match edhoc_third_message(msg.to_vec(), msg2_reciever, r_static_pub) {
+                    //let (msg3, Msg4_Reciever) =
+                    //println!("{:?}", buffer);
+                    match edhoc_third_message(buffer.to_vec(), msg2_reciever, r_static_pub) {
                         Ok((msg3, Msg4_Reciever)) => {
                             let (msg, len) = lora_send(msg3);
                             let transmit = lora.transmit_payload_busy(msg, len);
                             match transmit {
-                                Ok(packet_size) => println!("Sent packet with size: {:?}", packet_size),
+                                Ok(packet_size) => {
+                                    println!("Sent packet with size: {:?}", packet_size)
+                                }
                                 Err(_) => println!("Error"),
+                            }
+                            let poll = lora.poll_irq(Some(5000), &mut Delay);
+                            match poll {
+                                Ok(size) => {
+                                    println!("Recieved packet with size: {:?}", size);
+                                    let buffer = lora.read_packet().unwrap(); // Received buffer. NOTE: 255 bytes are always returned
+                                                                              //println! {"{:?}", buffer}
+                                    match buffer[0] {
+                                        3 => {
+                                            //println!("Do something");
+                                            let (ed_sck, ed_rck, ed_rk) =
+                                                handle_message_fourth(buffer, Msg4_Reciever);
+                                            Ok((lora, ed_sck, ed_rck, ed_rk))
+                                        }
+                                        _ => {
+                                            //println!("VAGT I GEVÆRET, NOGLE SNYDER");
+                                            Err(Box::new(MyError(
+                                                "Wrong order, got some other message than mtype 3"
+                                                    .to_string(),
+                                            )))
+                                            //return Err("error");
+                                        }
+                                    }
+                                }
+                                Err(_) => Err(Box::new(MyError(
+                                    "Recieved nothing in our allocated time span".to_string(),
+                                ))),
                             }
                         }
                         Err(OwnOrPeerError::PeerError(x)) => {
-                            println!("Something went horrible wrong! {:?}", x)
+                            //println!("Something went horrible wrong! {:?}", x);
+                            Err(Box::new(MyError(x)))
                         }
                         Err(OwnOrPeerError::OwnError(x)) => {
-                            println!("TODO: Send error message")
+                            //println!("TODO: Send error message");
+                            Err(Box::new(MyError("Own error".to_string())))
                         }
                     }
                 }
-                _ => println!("VAGT I GEVÆRET, NOGLE SNYDER"),
+                _ => Err(Box::new(MyError(
+                    "Wrong order, got some other message than mtype 1".to_string(),
+                ))),
             }
         }
-        Err(_) => println!("Timeout"),
+        Err(_) => Err(Box::new(MyError(
+            "Recieved nothing in our allocated time span".to_string(),
+        ))),
     }
 }
 
@@ -152,8 +223,8 @@ fn edhoc_first_message(msg1_sender: PartyI<Msg1Sender>) -> (Vec<u8>, PartyI<Msg2
     // since the protocol hasn't started yet.
     msg1_sender.generate_message_1(METHOD_TYPE_I, SUITE_I).unwrap();
 
-    println!("msg1 sent {:?}", msg1_bytes);
-    println!("msg1 len {:?}", msg1_bytes.len());
+    //println!("msg1 sent {:?}", msg1_bytes);
+    //println!("msg1 len {:?}", msg1_bytes.len());
 
     // adding mtype
     //    let mut payload1 = [0].to_vec();
@@ -167,35 +238,35 @@ fn edhoc_third_message(
     msg2_receiver: PartyI<Msg2Receiver>,
     mut r_static_pub: PublicKey,
 ) -> Result<(Vec<u8>, PartyI<Msg4ReceiveVerify>), OwnOrPeerError> {
-    println!("");
-    println!("msg2.len before removing devaddr {:?} ", msg2.len());
+    //println!("msg2 before struct {:?}", msg2);
+    let msgStruc = remove_message(msg2);
+    //println!("");
+    ////println!("msg2.len before removing devaddr {:?} ", msg2.len());
     unsafe {
-        DEVADDR = msg2[0..4].try_into().unwrap();
-        println!("\nDevAdrr {:?}\n", DEVADDR);
+        DEVADDR = msgStruc.devaddr;
+        //println!("\nDevAdrr {:?}\n", DEVADDR);
     }
-    let msg2 = remove_devaddr(msg2);
-    println!("msg2.len {:?} ", msg2.len());
-    println!("msg2 {:?} ", msg2);
-
+    //println!("msg2 after struct {:?}", msgStruc.msg);
 
     // read from file, and check what key responds to r_kid
     // Needs to be used when verififying message2 instead of &r_static_pub.as_bytes()
-    let (r_kid, ad_r, msg2_verifier) =
-        match msg2_receiver.unpack_message_2_return_kid(msg2) {
-            Err(OwnOrPeerError::PeerError(s)) => return Err(OwnOrPeerError::PeerError(s)),
-            Err(OwnOrPeerError::OwnError(b)) => {
-                println!("First attempt at dying");
-                //return Ok(b)
-                println!("{:?}", &b);
-                return Err(OwnOrPeerError::OwnError(b));
-            }
-            Ok(val) => val,
-        };
+    let (r_kid, ad_r, msg2_verifier) = match msg2_receiver.unpack_message_2_return_kid(msgStruc.msg)
+    {
+        Err(OwnOrPeerError::PeerError(s)) => {
+            //println!("PeerError 1: {:?}", &s);
+            return Err(OwnOrPeerError::PeerError(s));
+        }
+        Err(OwnOrPeerError::OwnError(b)) => {
+            //println!("Ownerror 1: {:?}", &b);
+            return Err(OwnOrPeerError::OwnError(b));
+        }
+        Ok(val) => val,
+    };
     // I has now received the r_kid, such that the can retrieve the static key of r, and verify the first message
 
     let msg3_sender = match msg2_verifier.verify_message_2(&r_static_pub.as_bytes().to_vec()) {
         Err(OwnError(b)) => {
-            println!("Or here");
+            //println!("Or here");
             //return Ok(b)},
             return Err(OwnOrPeerError::OwnError(b));
         }
@@ -204,7 +275,7 @@ fn edhoc_third_message(
 
     let (msg4_receiver_verifier, msg3_bytes) = match msg3_sender.generate_message_3() {
         Err(OwnError(b)) => {
-            println!(" am i dying here?");
+            //println!(" am i dying here?");
             //panic!("Send these bytes: {}", hexstring(&b))
             return Err(OwnOrPeerError::OwnError(b));
         }
@@ -214,15 +285,46 @@ fn edhoc_third_message(
     // sending message 2
     // let mut payload3 = [2].to_vec();
     // payload3.extend(msg3_bytes);
-    let mut payload3 = prepare_message(msg3_bytes, 2, false);
+    let payload3 = prepare_message(msg3_bytes, 2, false);
     Ok((payload3, msg4_receiver_verifier))
 }
 
-fn remove_devaddr(msg: Vec<u8>) -> Vec<u8>{
+fn handle_message_fourth(
+    msg: Vec<u8>,
+    msg4_receiver_verifier: PartyI<Msg4ReceiveVerify>,
+) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    //let msg = remove_devaddr(msg);
+    let msgStruc = remove_message(msg);
+    //println!("msg4 {:?}", msgStruc.msg);
+    let out = msg4_receiver_verifier.receive_message_4(msgStruc.msg);
+    let out = match out {
+        Err(OwnOrPeerError::PeerError(s)) => {
+            panic!("Received error msg: {}", s)
+        }
+        Err(OwnOrPeerError::OwnError(b)) => {
+            panic!("Send these bytes: {}", hexstring(&b))
+        }
+        Ok(val) => val,
+    };
+    let (ed_sck, ed_rck, ed_rk) = out;
+
+    (ed_sck, ed_rck, ed_rk)
+}
+
+fn remove_devaddr(msg: Vec<u8>) -> Vec<u8> {
     msg[4..].to_vec()
 }
 
-fn prepare_message(msg: Vec<u8>, mtype: u8, first_msg: bool) -> Vec<u8>{
+fn remove_message(ogmsg: Vec<u8>) -> MessageStruct {
+    MessageStruct {
+        m: ogmsg[0],
+        fcntdown: ogmsg[1..3].try_into().unwrap(),
+        devaddr: ogmsg[3..7].try_into().unwrap(),
+        msg: ogmsg[7..].try_into().unwrap(),
+    }
+}
+
+fn prepare_message(msg: Vec<u8>, mtype: u8, first_msg: bool) -> Vec<u8> {
     let mut buffer = Vec::new();
     buffer.extend_from_slice(&mtype.to_be_bytes());
     unsafe {
