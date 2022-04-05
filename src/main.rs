@@ -15,8 +15,7 @@ use x25519_dalek_ng::{PublicKey, StaticSecret};
 
 use oscore::edhoc::{
     api::{Msg1Sender, Msg2Receiver, Msg4ReceiveVerify},
-    error::{Error, OwnError, OwnOrPeerError},
-    util::build_error_message,
+    error::{OwnError, OwnOrPeerError},
     PartyI,
 };
 
@@ -72,7 +71,7 @@ const R_STATIC_MATERIAL: [u8; 32] = [
 
 const DEVEUI: [u8; 8] = [0x1, 1, 2, 3, 2, 4, 5, 7];
 const APPEUI: [u8; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
-const DHR_CONST : u16 = 1;
+const DHR_CONST: u16 = 1;
 
 static mut FCNTUP: u16 = 0;
 static mut DEVADDR: [u8; 4] = [0, 0, 0, 0];
@@ -95,20 +94,28 @@ struct MessageStruct {
     msg: Vec<u8>,
 }
 
+struct RatchetKeys {
+    ed_sck: Vec<u8>,
+    ed_rck: Vec<u8>,
+    ed_rk: Vec<u8>,
+    devaddr: Vec<u8>,
+}
+
 fn main() {
-    //println!("Hello, world!");
-    let lora = setup_sx127x();
-    let (mut lora, ed_sck, ed_rck, ed_rk, devaddr) = edhoc_handshake(lora).unwrap();
+    let mut lora = setup_sx127x();
+    lora.set_signal_bandwidth(125000);
+    lora.set_spreading_factor(7);
+    let (mut lora, keys) = edhoc_handshake(lora).unwrap();
     println!("cleared EDHOC");
     //let mut i_ratchet: Option<state> = Some(None);
     let mut i_ratchet = state::init_i(
-        ed_rk.try_into().unwrap(),
-        ed_rck.try_into().unwrap(),
-        ed_sck.try_into().unwrap(),
-        devaddr.clone(),
+        keys.ed_rk.try_into().unwrap(),
+        keys.ed_rck.try_into().unwrap(),
+        keys.ed_sck.try_into().unwrap(),
+        keys.devaddr.clone(),
     );
     for n in 1..18000 {
-        let uplink = i_ratchet.ratchet_encrypt_payload(&[1; 34], &devaddr);
+        let uplink = i_ratchet.ratchet_encrypt_payload(&[1; 34], &keys.devaddr);
         let (msg_uplink, len_uplink) = lora_send(uplink);
         println!("uplink");
         let transmit = lora.transmit_payload_busy(msg_uplink, len_uplink);
@@ -119,21 +126,20 @@ fn main() {
             Err(_) => println!("Error uplink"),
         }
 
-        let ten_millis = time::Duration::from_millis(100);
+        let ten_millis = time::Duration::from_millis(10000);
 
         thread::sleep(ten_millis);
-
 
         if i_ratchet.fcnt_send >= DHR_CONST {
             let dhr_req = i_ratchet.i_initiate_ratch();
             let (msg_dhr_req, len_dhr_req) = lora_send(dhr_req);
-            println!("DHR_CONST");
+            //println!("DHR_CONST");
             let transmit = lora.transmit_payload_busy(msg_dhr_req, len_dhr_req);
             match transmit {
                 Ok(packet_size) => {
-                    println!("DHR_CONST Sent packet with size: {:?}", packet_size)
+                    println!("Sent packet with size: {:?}", packet_size)
                 }
-                Err(_) => println!("DHR_CONST Error {:?}", n),
+                Err(er) => println!("Error {:?}, {:?}", n, er),
             }
             let poll = lora.poll_irq(Some(5000), &mut Delay);
             match poll {
@@ -148,7 +154,7 @@ fn main() {
                         None => continue,
                     };
                 }
-                _ => println!("Error happened at DHR_REQ")
+                _ => println!("Error happened at DHR_REQ"),
             }
         } else {
             let poll = lora.poll_irq(Some(5000), &mut Delay);
@@ -164,31 +170,21 @@ fn main() {
                         None => continue,
                     };
                 }
-                _ => println!("Error happened at DHR_REQ")
+                _ => println!("Error happened at DHR_REQ"),
             }
         }
     }
     //lora.poll_irq(Some(5000), &mut Delay);
 }
 
-fn load_file(path: String) -> String {
-    let data = fs::read_to_string(path).expect("Unable to read file");
+fn _load_file(path: String) -> String {
     //rintln!("{}", data);
-    data
+    fs::read_to_string(path).expect("Unable to read file")
 }
 
 fn edhoc_handshake(
     mut lora: LoRa<Spi, OutputPin, OutputPin>,
-) -> Result<
-    (
-        LoRa<Spi, OutputPin, OutputPin>,
-        Vec<u8>,
-        Vec<u8>,
-        Vec<u8>,
-        Vec<u8>,
-    ),
-    Box<dyn stdError>,
-> {
+) -> Result<(LoRa<Spi, OutputPin, OutputPin>, RatchetKeys), Box<dyn stdError>> {
     // Sender besked til server - Send
     // Modtager besked fra server - Listen
     // Sender til server - Send
@@ -231,7 +227,7 @@ fn edhoc_handshake(
                     //let (msg3, Msg4_Reciever) =
                     //println!("{:?}", buffer);
                     match edhoc_third_message(buffer.to_vec(), msg2_reciever, r_static_pub) {
-                        Ok((msg3, Msg4_Reciever)) => {
+                        Ok((msg3, msg4_reciever)) => {
                             let (msg, len) = lora_send(msg3);
                             let transmit = lora.transmit_payload_busy(msg, len);
                             match transmit {
@@ -250,8 +246,14 @@ fn edhoc_handshake(
                                         3 => {
                                             //println!("Do something");
                                             let (ed_sck, ed_rck, ed_rk, devaddr) =
-                                                handle_message_fourth(buffer, Msg4_Reciever);
-                                            Ok((lora, ed_sck, ed_rck, ed_rk, devaddr))
+                                                handle_message_fourth(buffer, msg4_reciever);
+                                            let keys = RatchetKeys {
+                                                ed_sck,
+                                                ed_rck,
+                                                ed_rk,
+                                                devaddr,
+                                            };
+                                            Ok((lora, keys))
                                         }
                                         _ => {
                                             //println!("VAGT I GEVÆRET, NOGLE SNYDER");
@@ -272,7 +274,7 @@ fn edhoc_handshake(
                             //println!("Something went horrible wrong! {:?}", x);
                             Err(Box::new(MyError(x)))
                         }
-                        Err(OwnOrPeerError::OwnError(x)) => {
+                        Err(OwnOrPeerError::OwnError(_)) => {
                             //println!("TODO: Send error message");
                             Err(Box::new(MyError("Own error".to_string())))
                         }
@@ -308,32 +310,32 @@ fn edhoc_first_message(msg1_sender: PartyI<Msg1Sender>) -> (Vec<u8>, PartyI<Msg2
 fn edhoc_third_message(
     msg2: Vec<u8>,
     msg2_receiver: PartyI<Msg2Receiver>,
-    mut r_static_pub: PublicKey,
+    r_static_pub: PublicKey,
 ) -> Result<(Vec<u8>, PartyI<Msg4ReceiveVerify>), OwnOrPeerError> {
     //println!("msg2 before struct {:?}", msg2);
-    let msgStruc = remove_message(msg2);
+    let msg_struc = remove_message(msg2);
     //println!("");
     ////println!("msg2.len before removing devaddr {:?} ", msg2.len());
     unsafe {
-        DEVADDR = msgStruc.devaddr;
+        DEVADDR = msg_struc.devaddr;
         //println!("\nDevAdrr {:?}\n", DEVADDR);
     }
-    //println!("msg2 after struct {:?}", msgStruc.msg);
+    //println!("msg2 after struct {:?}", msg_struc.msg);
 
     // read from file, and check what key responds to r_kid
     // Needs to be used when verififying message2 instead of &r_static_pub.as_bytes()
-    let (r_kid, ad_r, msg2_verifier) = match msg2_receiver.unpack_message_2_return_kid(msgStruc.msg)
-    {
-        Err(OwnOrPeerError::PeerError(s)) => {
-            //println!("PeerError 1: {:?}", &s);
-            return Err(OwnOrPeerError::PeerError(s));
-        }
-        Err(OwnOrPeerError::OwnError(b)) => {
-            //println!("Ownerror 1: {:?}", &b);
-            return Err(OwnOrPeerError::OwnError(b));
-        }
-        Ok(val) => val,
-    };
+    let (_r_kid, _ad_r, msg2_verifier) =
+        match msg2_receiver.unpack_message_2_return_kid(msg_struc.msg) {
+            Err(OwnOrPeerError::PeerError(s)) => {
+                //println!("PeerError 1: {:?}", &s);
+                return Err(OwnOrPeerError::PeerError(s));
+            }
+            Err(OwnOrPeerError::OwnError(b)) => {
+                //println!("Ownerror 1: {:?}", &b);
+                return Err(OwnOrPeerError::OwnError(b));
+            }
+            Ok(val) => val,
+        };
     // I has now received the r_kid, such that the can retrieve the static key of r, and verify the first message
 
     let msg3_sender = match msg2_verifier.verify_message_2(&r_static_pub.as_bytes().to_vec()) {
@@ -366,9 +368,9 @@ fn handle_message_fourth(
     msg4_receiver_verifier: PartyI<Msg4ReceiveVerify>,
 ) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
     //let msg = remove_devaddr(msg);
-    let msgStruc = remove_message(msg);
-    //println!("msg4 {:?}", msgStruc.msg);
-    let out = msg4_receiver_verifier.receive_message_4(msgStruc.msg);
+    let msg_struc = remove_message(msg);
+    //println!("msg4 {:?}", msg_struc.msg);
+    let out = msg4_receiver_verifier.receive_message_4(msg_struc.msg);
     let out = match out {
         Err(OwnOrPeerError::PeerError(s)) => {
             panic!("Received error msg: {}", s)
@@ -380,11 +382,7 @@ fn handle_message_fourth(
     };
     let (ed_sck, ed_rck, ed_rk) = out;
 
-    (ed_sck, ed_rck, ed_rk, msgStruc.devaddr.to_vec())
-}
-
-fn remove_devaddr(msg: Vec<u8>) -> Vec<u8> {
-    msg[4..].to_vec()
+    (ed_sck, ed_rck, ed_rk, msg_struc.devaddr.to_vec())
 }
 
 fn remove_message(ogmsg: Vec<u8>) -> MessageStruct {
